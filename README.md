@@ -2,4 +2,4 @@
 - [ ] vq (optional)
 - [ ] difusion
 - [ ] vae
-- [ ] repq
+- [ ] repa
