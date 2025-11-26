@@ -1,0 +1,4 @@
+- [ ] ssl
+- [ ] vq (optional)
+- [ ] difusion
+- [ ] vae
