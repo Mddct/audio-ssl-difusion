@@ -3,12 +3,12 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from difusion import DiffLlamaPrefix
+from models.tts.tadicodec.llama_nar_prefix import DiffLlamaPrefix
 
 
 class SSL_DiT(nn.Module):
     """
-    SSL_DiT: A simplified Diffusion Transformer model for Text-to-Audio (TTS/Music/TTA)
+    SSL_DiT: A simplified Diffusion Transformer model for Text-to-Speech (TTS)
     that is directly conditioned on features from a pre-trained SSL model.
 
     This architecture consists of:
@@ -21,26 +21,80 @@ class SSL_DiT(nn.Module):
 
     def __init__(
             self,
-            # Target feature settings
             target_dim: int = 128,
             ssl_feature_dim: int = 1024,
-            # Transformer settings
             hidden_size: int = 1024,
             decoder_num_layers: int = 16,
             num_heads: int = 16,
-            # Conditioning settings
             use_text_cond: bool = True,
             text_vocab_size: int = 32100,
-            context_drop_p: float = 0.2,  # Dropout for prompt context
+            context_drop_p: float = 0.2,
             # Diffusion settings
-        sigma: float = 1e-5,
+            sigma: float = 1e-5,
             time_scheduler: str = "linear",
+            # Auxiliary loss settings
+            use_repa_loss: bool = False,
+            repa_layer_idx: int = 6,
             cfg: Optional[Any] = None,  # Config object for overriding
     ):
-        """
-        Initializes the SSL_DiT model.
-        """
         super().__init__()
+
+        # Override parameters with config object if provided
+        if cfg is not None:
+            target_dim = getattr(cfg, "target_dim", target_dim)
+            ssl_feature_dim = getattr(cfg, "ssl_feature_dim", ssl_feature_dim)
+            hidden_size = getattr(cfg, "hidden_size", hidden_size)
+            decoder_num_layers = getattr(cfg, "decoder_num_layers",
+                                         decoder_num_layers)
+            num_heads = getattr(cfg, "num_heads", num_heads)
+            use_text_cond = getattr(cfg, "use_text_cond", use_text_cond)
+            text_vocab_size = getattr(cfg, "text_vocab_size", text_vocab_size)
+            context_drop_p = getattr(cfg, "context_drop_p", context_drop_p)
+            sigma = getattr(cfg, "sigma", sigma)
+            time_scheduler = getattr(cfg, "time_scheduler", time_scheduler)
+            use_repa_loss = getattr(cfg, "use_repa_loss", use_repa_loss)
+            repa_layer_idx = getattr(cfg, "repa_layer_idx", repa_layer_idx)
+
+        self.target_dim = target_dim
+        self.ssl_feature_dim = ssl_feature_dim
+        self.hidden_size = hidden_size
+        self.decoder_num_layers = decoder_num_layers
+        self.num_heads = num_heads
+        self.use_text_cond = use_text_cond
+        self.text_vocab_size = text_vocab_size
+        self.context_drop_p = context_drop_p
+        self.sigma = sigma
+        self.time_scheduler = time_scheduler
+        self.use_repa_loss = use_repa_loss
+        self.repa_layer_idx = repa_layer_idx
+
+        # Text embedding layer
+        if self.use_text_cond:
+            self.text_emb = nn.Embedding(text_vocab_size, hidden_size)
+
+        # Projection layer for SSL features to match hidden_size
+        self.ssl_cond_projection = nn.Linear(self.ssl_feature_dim,
+                                             self.hidden_size)
+
+        # Decoder: The Diffusion Transformer (DiT)
+        self.decoder = DiffLlamaPrefix(
+            hidden_size=hidden_size,
+            num_layers=decoder_num_layers,
+            num_heads=num_heads,
+            in_dim=self.target_dim,
+            out_dim=self.target_dim,
+            use_text_emb=use_text_cond,
+            use_diff_step=True,
+            use_cond=True,
+        )
+
+        # Repa (Representational Alignment) MLP for auxiliary loss
+        if self.use_repa_loss:
+            self.repa_mlp = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size * 2),
+                nn.GELU(),
+                nn.Linear(hidden_size * 2, self.ssl_feature_dim),
+            )
 
         # Override parameters with config object if provided
         if cfg is not None:
@@ -177,14 +231,28 @@ class SSL_DiT(nn.Module):
             target_latent, t, target_mask)
 
         # 4. Decoder pass (The DiT)
-        flow_pred = self.decoder(
-            x=xt,
-            x_mask=target_mask,
-            text_embedding=text_emb,
-            text_mask=text_mask,
-            cond=cond_emb,
-            diffusion_step=new_t,
-        )
+        if self.use_repa_loss:
+            # If using Repa loss, we need to output intermediate hidden states
+            flow_pred, hidden_states = self.decoder(
+                x=xt,
+                x_mask=target_mask,
+                text_embedding=text_emb,
+                text_mask=text_mask,
+                cond=cond_emb,
+                diffusion_step=new_t,
+                output_hidden_states=True,
+            )
+            ssl_feat_pred = self.repa_mlp(hidden_states[self.repa_layer_idx])
+        else:
+            flow_pred = self.decoder(
+                x=xt,
+                x_mask=target_mask,
+                text_embedding=text_emb,
+                text_mask=text_mask,
+                cond=cond_emb,
+                diffusion_step=new_t,
+            )
+            ssl_feat_pred = None
 
         # Predict the clean latent `x0_pred` from the noisy input `xt` and the predicted flow
         # Note: The original `t` of shape (B,) is used here, and needs unsqueezing.
@@ -199,6 +267,7 @@ class SSL_DiT(nn.Module):
             "x_pred": x_pred,
             "final_mask": final_mask,
             "prompt_len": prompt_len,
+            "ssl_feat_pred": ssl_feat_pred,
         }
 
     @torch.no_grad()
